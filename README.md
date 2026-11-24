@@ -1,46 +1,154 @@
-# 行业数据库自动化更新 Pipeline 架构
+# Industry DB Updater
 
-## 1. 设计初衷
+**English** | [简体中文](README.zh-CN.md)
 
-针对日益庞大的行业数据库（1000+ 个 Sheet）更新任务，传统的“硬编码 + 复制粘贴”方式带来了极大的维护成本、冗余代码和执行瓶颈。
+A configuration-driven Python pipeline that automatically refreshes industry research databases stored as Excel workbooks: it pulls raw indicator data, writes it into report templates, injects native Excel formulas, and keeps charts intact.
 
-新架构采用 **Data-Driven Configuration (配置驱动)** 与 **Pipeline (流水线)** 设计模式，彻底分离“业务逻辑（做什么）”与“底层能力（怎么做）”。
+Built during a data engineering internship at a securities research institute, where analysts maintain sector databases of **1,000+ worksheets** by hand on a regular basis.
 
-## 2. 架构分层
+---
 
-新架构按照职责划分为以下几个层次：
+## The Problem
 
-- **`configs/` (配置层)**：存放每个行业数据库独立的 YAML 配置文件。业务分析师或开发可以通过修改 YAML，实现指标的增删改查、公式的应用和后处理逻辑的调用。
-- **`core_engine/` (能力层)**：
-  - `data_reader.py`: 提供全局缓存能力的数据读取器，解决重复读取同一源文件导致的严重 I/O 瓶颈。
-  - `data_processor.py`: 内存级/Pandas 数据处理基座。负责在数据写入 Excel 前进行“洗切”（如排序、聚合、季度/YTD统计），供各个行业插件内部调用。
-  - `transformers.py`: 表现级/Excel 处理库。存放跨行业的通用 Excel 动作（如直接向单元格注入原生 Excel 公式 `"=B2/C2-1"`、调整格式等），暴露给 YAML 作为通用的 action 路由调用。
-  - `action_dispatcher.py`: 核心执行引擎，负责解析 YAML 配置，路由并分发动作。
-- **`plugins/` (特异逻辑层)**：存放特定行业独有的复杂数据处理逻辑。例如，航空库特有的季度统计、YTD 特殊差值计算、清洗早期数据等。这些逻辑被封装为插件函数，只在 YAML 中被调用。
-- **`run_xxx.py` (调度层)**：负责读取配置并启动引擎（未来可无缝接入 Dagster）。
+Each sector database (aviation, banking, macro, etc.) is a large Excel workbook that analysts update by copying new data from a data terminal export into dozens of formatted sheets, then extending year-over-year formulas, quarterly summaries and chart ranges.
 
-## 3. 工作流程 (以航空月报为例)
+The previous automation scripts were hard-coded per sheet and copy-pasted between sectors, which caused:
 
-1. **读取配置**：引擎读取 `configs/db_aviation.yaml`。
-2. **预加载与缓存**：引擎通过 `DataReader` 一次性将所需的源文件数据预加载到内存中。
-3. **打开目标文件**：目标 Excel 模板只被打开一次。
-4. **分发执行 (Action Dispatching)**：
-   - 对于通用公式（如同比），引擎调用 `transformers.py` 中的通用方法。
-   - 对于航空特有逻辑（如 `aviation_write_airline_sheet`），引擎从 `plugins.aviation_plugin` 路由调用对应的特异方法。
-5. **保存输出**：所有 Sheet 处理完毕后，目标 Excel 在内存中一次性保存至输出目录。
+- **High maintenance cost**: adding one indicator meant editing Python code
+- **Duplicated logic**: the same YoY / date-handling code was rewritten in every script
+- **Slow runs**: the same large source file was re-read for every sheet
 
-## 4. 如何新增一个数据库或 Sheet？
+## The Solution
 
-1. 如果只需使用已有能力，**完全不需要修改任何 Python 代码**，只需在对应的 `yaml` 文件中复制一份配置，修改 `sheet_name` 和 `indicators` 即可。
-2. 如果遇到了新的奇葩处理逻辑，则在 `plugins/` 下新建一个插件文件，编写处理函数，并在 YAML 的 `actions` 中通过 `type: "your_new_action"` 调用。
+The pipeline separates **what to do** (YAML configuration) from **how to do it** (reusable engine + sector plug-ins):
 
-## 5. 运行项目
+- **Config-driven**: each sector database is described by one YAML file. Adding a sheet or indicator only requires editing YAML, with no Python changes.
+- **Plug-in architecture**: sector-specific logic lives in isolated plug-in classes, and the engine dispatches to it by action name through a central registry.
+- **Read once, write once**: a cached `DataReader` loads each source sheet into memory once, and the target workbook is opened and saved exactly once per run.
+- **Native Excel output**: growth rates and summaries are written as real Excel formulas (e.g. `=B16/B4-1`), not hard-coded values, so analysts can still audit and edit the workbook.
+- **Safe by default**: every run writes to a timestamped copy of the template and never overwrites the original.
 
-运行命令：
-```bash
-python run_pipeline.py
+## Architecture
+
+```mermaid
+flowchart LR
+    A[YAML config<br/>configs/*.yaml] --> B[PipelineEngine<br/>action_dispatcher.py]
+    S[(Source Excel<br/>data terminal export)] --> R[DataReader<br/>cached reads]
+    R --> B
+    B -->|generic actions| T[transformers.py<br/>formula injection]
+    B -->|sector actions| P[plugins/*<br/>aviation, macro, bank ...]
+    P --> D[DataProcessor<br/>pandas: pivots, YoY, quarterly / YTD]
+    T --> O[(Timestamped<br/>output workbook)]
+    P --> O
 ```
-单个执行文件运行命令：
-```bash
-python run_pipeline.py -c configs/db_medical.yaml
+
+| Layer | Location | Responsibility |
+|---|---|---|
+| Configuration | `configs/` | One YAML file per sector database: source/target files, sheets, indicator-to-column mapping, ordered actions and post-processing steps |
+| Engine | `core_engine/action_dispatcher.py` | Parses YAML, pre-loads data, creates the output copy, routes each action to its handler through the action registry, saves once |
+| Data access | `core_engine/data_reader.py` | Validates the source file, caches whole sheets and parsed indicators by `(sheet, indicator_code)`, cleans invalid date rows |
+| Data processing | `core_engine/data_processor.py` | pandas utilities: date filtering, month × year pivots, YoY change, quarterly and YTD statistics, indicator merging |
+| Excel transforms | `core_engine/transformers.py` | Cross-sector Excel actions such as injecting YoY / MoM formulas into column ranges |
+| Sector plug-ins | `plugins/` | Logic unique to one sector (e.g. aviation "vs. 2019" recovery formulas, Spring Festival-aligned pivots for macro data) |
+| Runners | `run_pipeline.py`, `run_*.py` | Command-line entry points (single config or batch) |
+
+## How a Run Works
+
+Using the aviation database as an example:
+
+1. **Load config**: the engine reads `configs/db_aviation.yaml`.
+2. **Pre-load data**: `DataReader` loads the required source sheets into an in-memory cache.
+3. **Open target once**: a timestamped copy of the target template is created and opened.
+4. **Dispatch actions**: for each sheet, configured `actions` run in order, followed by `post_processes`:
+   - generic formulas → `transformers.apply_formula`
+   - aviation-specific steps (e.g. `aviation_write_airline_sheet`) → `AviationPlugin`
+5. **Save once**: the workbook is saved to the output directory after all sheets are processed.
+
+## Configuration Example
+
+```yaml
+industry: "Transport - Aviation"
+source_file: "data/aviation/source.xlsx"
+target_file: "data/aviation/target_template.xlsx"
+output_dir: "output_files"
+
+defaults:
+  start_date: "2014-01-01"
+  date_format: "yyyy-mm"
+  start_row: 4
+
+sheets:
+  - sheet_name: "Air China"
+    source_sheet: "Air China"
+    indicators:                 # indicator code -> target column
+      "AA000058863400": "B"
+      "AA000058863500": "E"
+    actions:
+      - type: "aviation_write_airline_sheet"
+      - type: "aviation_apply_yoy_formulas"
+        target_cols: ["C", "F"]
+        start_row: 16
+    post_processes:
+      - action: "aviation_clear_early_years_data"
+        params:
+          yoy_cols: ["C", "F"]
 ```
+
+## Quick Start
+
+**Requirements:** Python 3.9+
+
+```bash
+pip install pandas numpy openpyxl pyyaml zhdate
+```
+
+1. Set `source_file`, `target_file` and `output_dir` in the YAML file under `configs/`.
+2. Run one database:
+
+   ```bash
+   python run_pipeline.py -c configs/db_aviation.yaml
+   ```
+
+3. Or run every config in `configs/`:
+
+   ```bash
+   python run_pipeline.py --all
+   ```
+
+## Extending the Pipeline
+
+**Add a sheet or indicator (no code change).** Copy an existing sheet block in the sector's YAML file, then change `sheet_name`, `source_sheet` and the `indicators` mapping.
+
+**Add new processing logic.**
+
+1. Add a static method `my_action(context, params)` to a plug-in class in `plugins/`. `context` provides `wb`, `ws`, `data_reader`, `sheet_config` and `defaults`.
+2. Register it in `actions_registry` in `core_engine/action_dispatcher.py`.
+3. Call it from YAML with `type: "my_action"`.
+
+## Coverage
+
+| Sector database | Config | Sheets | Example logic |
+|---|---|---|---|
+| Transport – Aviation | `db_aviation.yaml` | 9 | 7 airlines; YoY and vs. 2019 growth/difference; quarterly, YTD and full-year blocks; cross-sheet monthly/quarterly summaries via `INDIRECT` |
+| Macro (mid-level activity tracking) | `db_macro.yaml` | 30 | ~60 indicators; month-day × year pivots with leap-day handling; Spring Festival week tags and Lunar New Year's Eve-relative pivots (lunar calendar via `zhdate`); ISO-week pivots |
+| Banking – key regulatory indicators | `db_bank_commercial.yaml` | 10 | Formula templates with placeholders (`{source_column}`, `{row-N}`, `{tname}`) for basis-point and YoY differences |
+| Healthcare | `db_medical.yaml` | 1 | Vertical-to-horizontal reshaping, quarterly headers, MoM/YoY formulas, quarter merging |
+| Utilities – Environment | `db_public_env.yaml` | 4 | Descending date layout, per-sheet unit conversion, dynamic report titles |
+| Electronics – Memory prices | `db_electronics.yaml` | 3 | Multi-section sheets; chart ranges rolled to the latest two years |
+| Consumer – Baijiu | `db_baijiu2.yaml` | 5 | Product matching and chart XML updates |
+
+**Total: 7 sector databases and 60+ worksheets.** The framework is designed to scale to the full 1,000+ sheet database.
+
+## Engineering Notes
+
+- **openpyxl chart bug fix.** openpyxl silently drops charts that reference external data, because `ExternalData.id` does not handle the namespaced `r:id` attribute. The engine monkey-patches the descriptor (`allow_none=True` plus the `REL_NS` namespace mapping) so these charts survive a load–save round trip. See the top of `core_engine/action_dispatcher.py`.
+- **Dirty-data tolerance.** Non-date rows in source exports (footers, notes) are coerced and filtered before writing.
+- **Calendar-aware analytics.** Macro pivots align years by Spring Festival week or by days relative to Lunar New Year's Eve, so seasonal patterns can be compared across years.
+
+## Documentation
+
+See [`配套文档.md`](配套文档.md) (Chinese) for a function-level reference: inputs and outputs of every engine module and plug-in action, plus a per-sheet checklist for each sector.
+
+## Tech Stack
+
+Python · pandas · NumPy · openpyxl · PyYAML · zhdate
